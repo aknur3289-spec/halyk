@@ -2,8 +2,9 @@ annotated-types==0.8.0
 cffi==2.1.1
 charset-normalizer==3.4.9
 cryptography==50.0.0
+groq>=0.31.0
 iniconfig==2.3.0
-numpy==2.5.1
+numpy==2.3.5
 packaging==26.3
 pandas==3.0.5
 pdfminer.six==20260107

@@ -10,9 +10,13 @@ class AggregateLimitCalculator(Calculator):
         ledger,
     ) -> float:
 
-        total = 0.0
-
-        for txn in ledger:
-            total += abs(txn.amount)
-
-        return total
+        # Stage 4 supplies scenario-level FinancialFacts.  A covenant such as
+        # "Debt <= 300,000" must use that reported debt value, not the sum of
+        # every ledger movement (which would double count activity).
+        value = getattr(facts, covenant.metric, None)
+        if value is None:
+            raise ValueError(
+                f"No FinancialFacts value is available for aggregate metric: "
+                f"{covenant.metric}"
+            )
+        return float(value)

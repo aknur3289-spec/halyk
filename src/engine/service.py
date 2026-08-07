@@ -1,13 +1,16 @@
-from src.engine.calculators import Calculator
 from src.engine.evaluator import FinancialEngine
+from src.engine.registry import CALCULATORS
 
 
 class EngineService:
 
     @staticmethod
     def evaluate(covenant, facts, ledger):
+        calculator = CALCULATORS.get(covenant.calculator)
+        if calculator is None:
+            raise ValueError(f"Unknown calculator: {covenant.calculator}")
 
-        actual = Calculator.calculate(
+        actual = calculator.calculate(
             covenant,
             facts,
             ledger,
