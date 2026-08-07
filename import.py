@@ -41,7 +41,7 @@ for pdf_file in pdf_folder.glob("*.pdf"):
     })
 
 # Сохраняем результат
-with open("parsed_documents.json", "w", encoding="utf-8") as f:
+with open("data/parsed_documents.json", "w", encoding="utf-8") as f:
     json.dump(documents, f, ensure_ascii=False, indent=4)
 
 print("=" * 50)
