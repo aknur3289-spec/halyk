@@ -1,50 +1,103 @@
 from pathlib import Path
-import pdfplumber
 import json
 
-# Папка с PDF
-pdf_folder = Path("documents")
+import pdfplumber
 
-documents = []
 
-# Проходим по всем PDF
-for pdf_file in pdf_folder.glob("*.pdf"):
-    print(f"Обрабатываю: {pdf_file.name}")
+class PDFDocumentParser:
 
-    pages = []
+    def __init__(self, pdf_folder: str, output_file: str):
+        self.pdf_folder = Path(pdf_folder)
+        self.output_file = Path(output_file)
 
-    with pdfplumber.open(pdf_file) as pdf:
-        print(f"Страниц: {len(pdf.pages)}")
+        self.ocr_pages = 0
+        self.documents = []
 
-        for page in pdf.pages:
+    def parse_pdf(self, pdf_path: Path) -> dict:
 
-            # Извлекаем текст
-            text = page.extract_text()
+        print(f"Processing: {pdf_path.name}")
 
-            # Проверяем, нужен ли OCR
-            if text is None or text.strip() == "":
-                print(f"[OCR] {pdf_file.name}, страница {page.page_number} - нужен OCR")
-                text = ""
+        pages = []
 
-            # Извлекаем таблицы
-            tables = page.extract_tables()
+        with pdfplumber.open(pdf_path) as pdf:
 
-            pages.append({
-                "page": page.page_number,
-                "text": text,
-                "tables": tables
-            })
+            print(f"Pages: {len(pdf.pages)}")
 
-    documents.append({
-        "filename": pdf_file.name,
-        "pages": pages
-    })
+            for page in pdf.pages:
 
-# Сохраняем результат
-with open("parsed_documents.json", "w", encoding="utf-8") as f:
-    json.dump(documents, f, ensure_ascii=False, indent=4)
+                text = page.extract_text() or ""
 
-print("=" * 50)
-print("Готово!")
-print(f"Обработано PDF: {len(documents)}")
-print("Результат сохранен в parsed_documents.json")
+                tables = page.extract_tables()
+
+                # Пока только отмечаем страницы без текста
+                if not text.strip():
+
+                    print(
+                        f"[OCR] {pdf_path.name}, "
+                        f"page {page.page_number}"
+                    )
+
+                    self.ocr_pages += 1
+                    text = ""
+
+                pages.append(
+                    {
+                        "page": page.page_number,
+                        "text": text,
+                        "tables": tables,
+                    }
+                )
+
+        return {
+            "filename": pdf_path.name,
+            "pages": pages,
+        }
+
+    def parse(self) -> list[dict]:
+
+        if not self.pdf_folder.exists():
+            raise FileNotFoundError(
+                f"PDF folder not found: {self.pdf_folder}"
+            )
+
+        pdf_files = sorted(
+            self.pdf_folder.glob("*.pdf")
+        )
+
+        for pdf_file in pdf_files:
+            document = self.parse_pdf(pdf_file)
+            self.documents.append(document)
+
+        self._save()
+
+        return self.documents
+
+    def _save(self) -> None:
+
+        with self.output_file.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                self.documents,
+                file,
+                ensure_ascii=False,
+                indent=4,
+            )
+
+        print("=" * 50)
+        print("Done!")
+        print(f"Processed PDFs: {len(self.documents)}")
+        print(f"OCR pages: {self.ocr_pages}")
+        print(f"Saved to: {self.output_file}")
+
+
+if __name__ == "__main__":
+
+    parser = PDFDocumentParser(
+        pdf_folder="documents",
+        output_file="parsed_documents.json",
+    )
+
+    parser.parse()
