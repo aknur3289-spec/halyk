@@ -1,31 +1,20 @@
+"""Calculator interfaces and common calculation output."""
+
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-
-from src.models import (
-    CovenantSpec,
-    FinancialFacts,
-    LedgerTransaction,
-)
+from dataclasses import dataclass, field
+from typing import Any
 
 
-class Calculator:
+@dataclass(frozen=True)
+class CalculationOutput:
+    actual: float
+    candidate_transactions: list[str] = field(default_factory=list)
+    trace: dict[str, Any] = field(default_factory=dict)
 
-    @staticmethod
-    def calculate(covenant, facts, ledger):
 
-        metric = covenant.metric
-
-        if metric == "debt":
-            return facts.debt
-
-        if metric == "ebitda":
-            return facts.ebitda
-
-        if metric == "cash":
-            return facts.cash
-
-        if metric == "revenue":
-            return facts.revenue
-
-        raise ValueError(
-            f"Unknown metric {metric}"
-        )
+class Calculator(ABC):
+    @abstractmethod
+    def calculate(self, covenant, facts, ledger) -> CalculationOutput:
+        """Return the raw metric value and the transactions used to derive it."""

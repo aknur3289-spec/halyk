@@ -1,5 +1,4 @@
 import pandas as pd
-from src.ledger.mapper import extract_scenario_id
 from .mapper import extract_scenario_id
 
 class LedgerSplitter:

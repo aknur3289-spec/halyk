@@ -16,18 +16,18 @@ OPERATORS = {
 class FinancialEngine:
 
     @staticmethod
-    def evaluate(actual, threshold, operator_symbol):
-
+    def is_satisfied(actual, threshold, operator_symbol) -> bool:
         if operator_symbol not in OPERATORS:
             raise ValueError(
                 f"Unsupported operator: {operator_symbol}"
             )
+        return OPERATORS[operator_symbol](actual, threshold)
 
-        comparison = OPERATORS[operator_symbol]
-
+    @staticmethod
+    def evaluate(actual, threshold, operator_symbol):
         status = (
             CovenantStatus.COMPLIANT
-            if comparison(actual, threshold)
+            if FinancialEngine.is_satisfied(actual, threshold, operator_symbol)
             else CovenantStatus.BREACH
         )
 

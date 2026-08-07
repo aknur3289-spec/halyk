@@ -1,25 +1,31 @@
-from .calculators import Calculator
+from .calculators import CalculationOutput, Calculator
 
 
 class RatioCalculator(Calculator):
-
-    def calculate(
-        self,
-        covenant,
-        facts,
-        ledger,
-    ) -> float:
+    def calculate(self, covenant, facts, ledger) -> CalculationOutput:
         if covenant.metric == "debt_to_ebitda":
-            if facts.debt is None or facts.ebitda is None:
-                raise ValueError("debt_to_ebitda requires both debt and ebitda facts")
-            if facts.ebitda == 0:
-                raise ValueError("debt_to_ebitda cannot be calculated with EBITDA equal to zero")
-            return float(facts.debt / facts.ebitda)
+            numerator_metric, denominator_metric = "debt", "ebitda"
+        else:
+            numerator_metric = covenant.ratio_numerator
+            denominator_metric = covenant.ratio_denominator
 
-        # DSCR needs debt-service data, which is intentionally not present in
-        # the current FinancialFacts model.  Fail explicitly instead of
-        # producing an invented result.
-        if covenant.metric == "dscr":
-            raise ValueError("dscr is not supported until FinancialFacts includes debt_service")
-
-        raise ValueError(f"Unsupported ratio metric: {covenant.metric}")
+        if not numerator_metric or not denominator_metric:
+            raise ValueError("ratio requires numerator and denominator metrics")
+        numerator = facts.value_for(numerator_metric)
+        denominator = facts.value_for(denominator_metric)
+        if numerator is None or denominator is None:
+            raise ValueError(
+                f"ratio requires facts for {numerator_metric} and {denominator_metric}"
+            )
+        if denominator == 0:
+            raise ValueError(f"ratio denominator {denominator_metric} cannot be zero")
+        return CalculationOutput(
+            actual=float(numerator / denominator),
+            trace={
+                "calculation_kind": "ratio",
+                "numerator_metric": numerator_metric,
+                "denominator_metric": denominator_metric,
+                "numerator": float(numerator),
+                "denominator": float(denominator),
+            },
+        )

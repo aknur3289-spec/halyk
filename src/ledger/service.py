@@ -26,13 +26,17 @@ class LedgerService:
         self.scenario_ledgers = LedgerSplitter.split(self.df)
 
     def get_scenario(self, account_id: str) -> str:
+        if self.df is None:
+            raise RuntimeError("LedgerService.initialize() must be called before use")
         if account_id not in self.account_mapping:
             raise ValueError(f"Unknown account_id: {account_id}")
 
         return self.account_mapping[account_id]
 
     def get_ledger(self, scenario_id: str) -> pd.DataFrame:
+        if self.df is None:
+            raise RuntimeError("LedgerService.initialize() must be called before use")
         if scenario_id not in self.scenario_ledgers:
             raise ValueError(f"Unknown scenario_id: {scenario_id}")
 
-        return self.scenario_ledgers[scenario_id]
+        return self.scenario_ledgers[scenario_id].copy()
