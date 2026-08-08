@@ -62,6 +62,7 @@ def build_ledger_derivation_context(
     }
     related_parties: dict[str, tuple[str, ...]] = {}
     documented: dict[tuple[str, str], DocumentedLedgerInput] = {}
+    excluded_transactions: dict[str, tuple[str, ...]] = {}
     covenant_text_by_scenario = _covenant_text_by_scenario(covenant_rows, documents)
     requirements_by_scenario = _covenant_requirements_by_scenario(
         covenant_rows, covenant_text_by_scenario
@@ -114,18 +115,64 @@ def build_ledger_derivation_context(
             if item is not None:
                 documented[(scenario_id, "accepted_auditor_addbacks")] = item
 
+        # Final auditor reports can move a specific ledger amount between
+        # accounting categories for covenant purposes.  Keep these as
+        # documented components rather than changing the raw ledger export.
+        for target_metric, key in (
+            ("Процентные расходы", "interest_expense_adjustment"),
+            ("Операционные расходы", "operating_expense_adjustment"),
+            ("Страховые премии", "insurance_premium_adjustment"),
+        ):
+            item = _parse_final_reclassification(filename, page_text, target_metric)
+            if item is not None:
+                documented[(scenario_id, key)] = item
+        excluded = _parse_excluded_transaction_ids(filename, page_text)
+        if excluded:
+            excluded_transactions[scenario_id] = tuple(
+                dict.fromkeys((*excluded_transactions.get(scenario_id, ()), *excluded))
+            )
+
+    # A source-backed treasury memo can disclose a missing ledger amount.  It
+    # is not a final audit report, but the explicit transaction ID and amount
+    # are still sufficient evidence for the corresponding category.
+    for document in documents:
+        filename = str(document.get("filename", ""))
+        pages = document.get("pages", [])
+        if not isinstance(pages, list):
+            continue
+        page_text = {int(page["page"]): str(page.get("text") or "") for page in pages if page.get("page")}
+        text = "\n".join(page_text.values())
+        account_match = re.search(r"\b(ACC-\d+)\b", text, flags=re.IGNORECASE)
+        if account_match is None:
+            continue
+        scenario_id = scenario_by_account.get(account_match.group(1).upper())
+        if scenario_id is None:
+            continue
+        missing_tax = _parse_missing_tax_amount(filename, page_text)
+        if missing_tax is not None:
+            documented[(scenario_id, "taxes_adjustment")] = missing_tax
+
     borrowers_by_account = _borrowers_by_account(stage2_rows)
     for scenario_id, requirements in requirements_by_scenario.items():
         if not requirements.group_capex:
             continue
-        borrower = _borrower_for_scenario(covenant_rows, scenario_id, borrowers_by_account)
+        borrower = _borrower_for_scenario(
+            covenant_rows,
+            scenario_id,
+            borrowers_by_account,
+            covenant_text_by_scenario,
+        )
         if borrower is None:
             continue
         group_capex = _parse_group_capex(documents, borrower)
         if group_capex is not None:
             documented[(scenario_id, "group_capital_expenditure")] = group_capex
 
-    return LedgerDerivationContext(related_parties=related_parties, documented_inputs=documented)
+    return LedgerDerivationContext(
+        related_parties=related_parties,
+        documented_inputs=documented,
+        excluded_transaction_ids=excluded_transactions,
+    )
 
 
 def _covenant_requirements_by_scenario(
@@ -202,10 +249,33 @@ def _borrowers_by_account(stage2_rows: Sequence[Mapping[str, Any]]) -> dict[str,
 
 
 def _borrower_for_scenario(
-    covenant_rows: Sequence[Mapping[str, Any]], scenario_id: str, borrowers_by_account: Mapping[str, str]
+    covenant_rows: Sequence[Mapping[str, Any]],
+    scenario_id: str,
+    borrowers_by_account: Mapping[str, str],
+    covenant_text_by_scenario: Mapping[str, str] | None = None,
 ) -> str | None:
     """Use the Stage-2 exact legal entity when it has been propagated to a row."""
 
+    # Some Stage-2 rows intentionally contain a lender/auditor header instead
+    # of the borrower.  For group-scope covenants, the agreement's explicit
+    # ``Borrower, <legal entity>`` phrase is authoritative and is safer than
+    # fuzzy matching a name in an unrelated document.
+    text = (covenant_text_by_scenario or {}).get(scenario_id, "")
+    match = re.search(
+        r"(?:за[её]мщик|borrower)\s*,?\s*([A-ZА-ЯЁ][^,.;()\n]+?\b(?:JSC|LLP|LLC|LTD))",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return " ".join(match.group(1).split()).strip(" \t,.;")
+    legal_entities = re.findall(
+        r"\b([A-Z][A-Za-z0-9&'’-]*(?:\s+[A-Z][A-Za-z0-9&'’-]*){1,6}\s+(?:JSC|LLP|LLC|LTD))\b",
+        text,
+    )
+    for entity in legal_entities:
+        compact = entity.casefold()
+        if "bank" not in compact and "audit" not in compact and "assurance" not in compact:
+            return " ".join(entity.split())
     for row in covenant_rows:
         if str(row.get("scenario_id")) == scenario_id:
             account = row.get("account_id")
@@ -297,7 +367,12 @@ def _parse_kyc_related_parties(text: str) -> list[str]:
 
 def _is_final_auditor_document(text: str) -> bool:
     compact = text.casefold()
-    is_auditor_document = "аудиторское дело" in compact or "final auditor report" in compact
+    is_auditor_document = (
+        "аудиторское дело" in compact
+        or "final auditor report" in compact
+        or "согласованных процедур" in compact
+        or "окончательной позицией аудитора" in compact
+    )
     return is_auditor_document and not any(marker in compact for marker in _INACTIVE_MARKERS)
 
 
@@ -396,11 +471,76 @@ def _parse_p8_employee_obligation(
             text,
             flags=re.IGNORECASE,
         )
+        missing = re.search(
+            r"операция\s+TXN-P8-0031[^$]{0,240}?фактическая сумма операции составляет\s+\$([\d,]+(?:\.\d+)?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match or missing:
+            severance = float(match.group(1).replace(",", "")) if match else 0.0
+            missing_amount = float(missing.group(1).replace(",", "")) if missing else 0.0
+            quote_parts = [part for part in (match.group(0) if match else "", missing.group(0) if missing else "") if part]
+            return DocumentedLedgerInput(
+                value=round(severance + missing_amount, 2),
+                evidence=(SourceEvidence(document_id=filename, page=page, quote="\n".join(quote_parts)),),
+            )
+    return None
+
+
+def _parse_final_reclassification(
+    filename: str,
+    page_text: Mapping[int, str],
+    target_metric_russian: str,
+) -> DocumentedLedgerInput | None:
+    """Parse an accepted category reclassification from a final audit report."""
+
+    for page, text in page_text.items():
+        match = re.search(
+            r"сумм[аы]\s+в\s+размере\s+\$([\d,]+(?:\.\d+)?)"
+            r"[^.]{0,260}?переклассифицирована[^.]{0,180}?как\s+"
+            + re.escape(target_metric_russian),
+            text,
+            flags=re.IGNORECASE,
+        )
         if match:
-            quote = match.group(0)
             return DocumentedLedgerInput(
                 value=float(match.group(1).replace(",", "")),
-                evidence=(SourceEvidence(document_id=filename, page=page, quote=quote),),
+                evidence=(SourceEvidence(document_id=filename, page=page, quote=match.group(0)),),
+            )
+    return None
+
+
+def _parse_excluded_transaction_ids(
+    filename: str, page_text: Mapping[int, str]
+) -> tuple[str, ...]:
+    values: list[str] = []
+    for page, text in page_text.items():
+        for match in re.finditer(
+            r"операци(?:я|и)\s+(TXN-[A-Z0-9-]+)[^.]{0,160}?исключен[ао]?\s+из\s+ковенант",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            values.append(match.group(1).upper())
+    return tuple(dict.fromkeys(values))
+
+
+def _parse_missing_tax_amount(
+    filename: str, page_text: Mapping[int, str]
+) -> DocumentedLedgerInput | None:
+    for page, text in page_text.items():
+        match = re.search(
+            r"операция\s+(TXN-[A-Z0-9-]+)[^$]{0,240}?сумма не отражена в выгрузке реестра;"
+            r"\s*фактическая сумма операции составляет\s+\$([\d,]+(?:\.\d+)?)\s*\(расход\)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match and any(
+            marker in text.casefold()
+            for marker in ("tax", "налог", "revenue committee")
+        ):
+            return DocumentedLedgerInput(
+                value=float(match.group(2).replace(",", "")),
+                evidence=(SourceEvidence(document_id=filename, page=page, quote=match.group(0)),),
             )
     return None
 

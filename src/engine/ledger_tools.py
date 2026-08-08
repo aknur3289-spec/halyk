@@ -105,7 +105,12 @@ def select_transactions(ledger: Any, covenant) -> pd.DataFrame:
     if period:
         frame = frame.loc[(frame["date"] >= period.start) & (frame["date"] <= period.end)]
 
-    searchable = (frame["description"].fillna("") + " " + frame["counterparty"].fillna("")).str.casefold()
+    # Category terms describe the accounting movement, not the legal entity
+    # receiving it.  Matching them against counterparty names can silently
+    # pull unrelated rows (for example a payroll supplier whose name contains
+    # "insurance").  Counterparty matching remains an explicit, separate
+    # selector below.
+    searchable = frame["description"].fillna("").str.casefold()
     if selector.include_terms:
         terms = [term.casefold() for term in selector.include_terms]
         include = pd.Series(False, index=frame.index)

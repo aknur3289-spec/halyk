@@ -10,12 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
+from datetime import date
 from typing import Any, Mapping
 
 import pandas as pd
 
 from src.engine.ledger_tools import select_transactions
-from src.models import CovenantSpec, FinancialFacts, SourceEvidence, TransactionSelector
+from src.models import CovenantSpec, DateRange, FinancialFacts, SourceEvidence, TransactionSelector
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,7 @@ class LedgerDerivationContext:
     documented_inputs: Mapping[tuple[str, str], DocumentedLedgerInput] = field(
         default_factory=dict
     )
+    excluded_transaction_ids: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,14 +64,30 @@ _METRIC_RULES: Mapping[str, _MetricRule] = {
     "financing_proceeds": _MetricRule(("facility drawdown", "loan drawdown"), sign="credit"),
     "capital_expenditure": _MetricRule(("purchase of",), ("reversal",), "debit"),
     "capital_expenditures": _MetricRule(("purchase of",), ("reversal",), "debit"),
+    "capital_expenditure_including_transfers": _MetricRule(
+        ("purchase of", "transfer of"), ("reversal",), "debit"
+    ),
     "personnel_expenses": _MetricRule(("payroll",), sign="debit"),
     "labor_expenses": _MetricRule(("payroll",), sign="debit"),
     "utility_expenses": _MetricRule(("electricity", "water", "utility", "heating", "compressed air", "gas"), sign="debit"),
     "taxes": _MetricRule(("tax", "duty", "levy"), sign="debit"),
     "interest_expense": _MetricRule(("interest",), sign="debit"),
     "insurance_premiums": _MetricRule(("insurance",), sign="debit"),
-    "lease_payments": _MetricRule(("lease",), ("interest", "deposit", "incentive"), "debit"),
+    "lease_payments": _MetricRule(
+        ("lease",),
+        ("interest", "deposit", "incentive", "leased line", "antenna mast"),
+        "debit",
+    ),
     "rent_and_utility_expenses": _MetricRule(("rent", "lease", "electricity", "water", "utility", "heating", "compressed air", "gas"), ("interest", "deposit", "incentive"), "debit"),
+    # This is intentionally narrower than the component metrics below.  The
+    # agreements use an explicit operating-cost line; summing every payroll,
+    # utility, insurance and lease movement would double-count categories that
+    # are not part of that line in the audited schedule.
+    "operating_expenses": _MetricRule(
+        ("operating costs", "operating expenses", "operating and maintenance"),
+        ("interest",),
+        "debit",
+    ),
 }
 
 _AUDITOR_ADDBACK_METRICS = frozenset(
@@ -99,6 +117,32 @@ def _metric_from_source_label(value: str | None) -> str | None:
         return "accepted_auditor_addbacks"
     if identifier in _CANONICAL_DOCUMENTED_METRICS:
         return identifier
+
+    # Exact compound labels must be resolved before substring aliases.  For
+    # example, ``adjusted_revenue`` contains ``revenue`` and
+    # ``personnel_and_utility_expenses`` contains ``personnel``; matching the
+    # generic alias first changes the calculation rule and produces a valid-
+    # looking but wrong result.
+    exact_aliases = {
+        "adjusted_revenue": "adjusted_revenue",
+        "adjusted_ebitda": "adjusted_ebitda",
+        "operating_expenses_and_lease_payments": "operating_expenses_and_lease_payments",
+        "financing_and_revenue": "financing_and_revenue",
+        "revenue_plus_financing_proceeds": "financing_and_revenue",
+        "operating_and_capex": "operating_and_capex",
+        "operating_expenses_plus_capital_expenditures": "operating_and_capex",
+        "labor_and_utilities": "labor_and_utilities",
+        "personnel_and_utility_expenses": "labor_and_utilities",
+        "taxes_and_utilities": "taxes_and_utilities",
+        "rent_and_utility_expenses": "rent_and_utility_expenses",
+        "individual_overhead_line": "individual_overhead_line",
+        "employee_obligation_expense": "employee_obligation_expense",
+        "related_party_payments": "related_party_payments",
+        "transferred_capital_assets": "transferred_capital_assets",
+        "capital_expenditure_including_transfers": "capital_expenditure_including_transfers",
+    }
+    if identifier in exact_aliases:
+        return exact_aliases[identifier]
 
     text = identifier.replace("_", " ")
     has = lambda *terms: any(term in text for term in terms)
@@ -144,6 +188,7 @@ def _canonical_formula(covenant: CovenantSpec, context: LedgerDerivationContext)
     denominator = _metric_from_source_label(covenant.ratio_denominator)
     metric = _metric_from_source_label(covenant.metric) or covenant.metric
     scenario = str(covenant.scenario_id)
+    quote = str((covenant.evidence.quote if covenant.evidence else "") or "").casefold()
     if (scenario, "group_capital_expenditure") in context.documented_inputs and (
         "capital" in (covenant.metric or "").casefold() or "capex" in (covenant.metric or "").casefold()
     ):
@@ -154,7 +199,23 @@ def _canonical_formula(covenant: CovenantSpec, context: LedgerDerivationContext)
         if numerator:
             update["ratio_numerator"] = numerator
         if denominator:
+            if (
+                denominator == "capital_expenditure"
+                and "передан" in quote
+                and "капитальн" in quote
+            ):
+                denominator = "capital_expenditure_including_transfers"
             update["ratio_denominator"] = denominator
+    # Stage 3 sometimes only captures a quarter-end date.  The source quote
+    # remains the authority for the period; turn an explicit fourth-quarter
+    # definition into a deterministic ledger range before selecting rows.
+    if quote and ("четвёрт" in quote or "четверт" in quote or "fourth quarter" in quote or "q4" in quote):
+        if isinstance(covenant.period, DateRange) and covenant.period.start == covenant.period.end:
+            end = covenant.period.end
+            update["period"] = DateRange(start=date(end.year, 10, 1), end=end)
+        elif isinstance(covenant.period, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", covenant.period):
+            end = date.fromisoformat(covenant.period)
+            update["period"] = DateRange(start=date(end.year, 10, 1), end=end)
     return covenant.model_copy(update=update)
 
 
@@ -280,21 +341,60 @@ def compile_ledger_inputs(
         elif normalized == "operating_and_capex":
             value = get("operating_expenses") + get("capital_expenditure")
         elif normalized == "labor_and_utilities":
-            value = get("labor_expenses") + get("utility_expenses")
+            value = get("personnel_expenses") + get("utility_expenses")
         elif normalized == "taxes_and_utilities":
             value = get("taxes") + get("utility_expenses")
+        elif normalized == "taxes":
+            value, selected_ids = _metric_selection(compiled, ledger, normalized, context)
+            ids.extend(selected_ids)
+            adjustment = context.documented_inputs.get(
+                (str(compiled.scenario_id), "taxes_adjustment")
+            )
+            if adjustment is not None:
+                value += float(adjustment.value)
         elif normalized == "individual_overhead_line":
             value = max(get("personnel_expenses"), get("utility_expenses"))
         elif normalized == "adjusted_revenue":
-            value = get("revenue") - max(get("labor_expenses"), get("taxes"))
+            value = get("revenue") - max(get("personnel_expenses"), get("taxes"))
         elif normalized == "employee_obligation_expense":
             # A final-auditor disclosed employee obligation is in addition to
             # payroll and must be supplied in documented_inputs.
             value = get("personnel_expenses") + get("final_auditor_employee_obligation")
         elif normalized == "operating_expenses":
-            # The source-defined operating cost pool is the sum of explicit
-            # operating classifications, not all debit movements.
-            value = sum(get(part) for part in ("personnel_expenses", "utility_expenses", "insurance_premiums", "lease_payments"))
+            value, selected_ids = _metric_selection(compiled, ledger, normalized, context)
+            if selected_ids:
+                ids.extend(selected_ids)
+            else:
+                # Keep compatibility with small synthetic/legacy ledgers that
+                # have component categories but no explicit operating-cost
+                # line.  Public ledgers use the source-defined line above.
+                value = sum(
+                    get(part)
+                    for part in (
+                        "personnel_expenses",
+                        "utility_expenses",
+                        "insurance_premiums",
+                        "lease_payments",
+                    )
+                )
+            adjustment = context.documented_inputs.get(
+                (str(compiled.scenario_id), "operating_expense_adjustment")
+            )
+            if adjustment is not None:
+                value += float(adjustment.value)
+        elif normalized in {"interest_expense", "insurance_premiums"}:
+            value, selected_ids = _metric_selection(compiled, ledger, normalized, context)
+            ids.extend(selected_ids)
+            adjustment_key = (
+                "interest_expense_adjustment"
+                if normalized == "interest_expense"
+                else "insurance_premium_adjustment"
+            )
+            adjustment = context.documented_inputs.get(
+                (str(compiled.scenario_id), adjustment_key)
+            )
+            if adjustment is not None:
+                value += float(adjustment.value)
         else:
             value, selected_ids = _metric_selection(compiled, ledger, normalized, context)
             ids.extend(selected_ids)
