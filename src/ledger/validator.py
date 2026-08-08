@@ -14,6 +14,8 @@ import math
 from pathlib import Path
 from typing import Any, TypeAlias
 
+from .schema import iter_submission_answer_rows
+
 JsonDocument: TypeAlias = dict[str, Any]
 VALID_STATUSES = frozenset({"COMPLIANT", "BREACH"})
 ANSWER_KEYS = frozenset({"status", "actual", "evidence_txn_id"})
@@ -79,6 +81,57 @@ def validate_submission(submission: Mapping[str, Any] | str | Path) -> Validatio
         return ValidationResult([ValidationIssue("$", "Root value must be a JSON object")])
 
     issues: list[ValidationIssue] = []
+    if "answers" in submission:
+        answers = submission["answers"]
+        if not isinstance(answers, Mapping):
+            issues.append(ValidationIssue("$.answers", "Must be a JSON object"))
+            return ValidationResult(issues)
+        if not answers:
+            issues.append(ValidationIssue("$.answers", "Must not be empty"))
+            return ValidationResult(issues)
+        for scenario_id, clauses in answers.items():
+            path = f"$.answers.{scenario_id}"
+            if not isinstance(scenario_id, (str, int)) or isinstance(scenario_id, bool):
+                issues.append(ValidationIssue(path, "Scenario key must be a string or integer"))
+                continue
+            if not isinstance(clauses, Mapping):
+                issues.append(ValidationIssue(path, "Must be a JSON object"))
+                continue
+            if not clauses:
+                issues.append(ValidationIssue(f"{path}.clauses", "Must not be empty"))
+            for clause, answer in clauses.items():
+                clause_path = f"{path}.{clause}"
+                if not isinstance(clause, str) or not clause:
+                    issues.append(ValidationIssue(clause_path, "Clause name must be a non-empty string"))
+                _validate_answer(answer, clause_path, issues)
+        return ValidationResult(issues)
+
+    scenarios_mapping = submission.get("scenarios")
+    if isinstance(scenarios_mapping, Mapping):
+        if not scenarios_mapping:
+            issues.append(ValidationIssue("$.scenarios", "Must not be empty"))
+            return ValidationResult(issues)
+        for scenario_id, scenario in scenarios_mapping.items():
+            path = f"$.scenarios.{scenario_id}"
+            if not isinstance(scenario_id, (str, int)) or isinstance(scenario_id, bool):
+                issues.append(ValidationIssue(path, "Scenario key must be a string or integer"))
+                continue
+            if not isinstance(scenario, Mapping):
+                issues.append(ValidationIssue(path, "Must be a JSON object"))
+                continue
+            clauses = scenario.get("covenants") or scenario.get("clauses") or scenario.get("answers")
+            if not isinstance(clauses, Mapping):
+                issues.append(ValidationIssue(path, "Must contain a covenant/answer mapping"))
+                continue
+            if not clauses:
+                issues.append(ValidationIssue(f"{path}.covenants", "Must not be empty"))
+            for clause, answer in clauses.items():
+                clause_path = f"{path}.{clause}"
+                if not isinstance(clause, str) or not clause:
+                    issues.append(ValidationIssue(clause_path, "Clause name must be a non-empty string"))
+                _validate_answer(answer, clause_path, issues)
+        return ValidationResult(issues)
+
     scenarios = list(_iter_scenarios(submission))
     if not scenarios:
         issues.append(ValidationIssue("$", "At least one scenario with 'scenario_id' is required"))

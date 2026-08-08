@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .schema import iter_submission_answer_rows, iter_truth_answer_rows
 from .validator import ValidationResult, load_submission, validate_submission
 
 DECAY_LIMIT = 0.05
@@ -198,25 +199,7 @@ def _answers_by_key(document: Mapping[str, Any]) -> dict[tuple[str | int, str], 
     """Normalize both supported clauses layouts into a lookup by scenario/clause."""
 
     answers: dict[tuple[str | int, str], Mapping[str, Any]] = {}
-    for scenario in _iter_scenarios(document):
-        scenario_id = scenario["scenario_id"]
-        clauses = scenario["clauses"]
-        if isinstance(clauses, Mapping):
-            for clause, answer in clauses.items():
-                answers[(scenario_id, clause)] = answer
-        else:
-            for answer in clauses:
-                clause = answer.get("clause", answer.get("clause_id"))
-                answers[(scenario_id, clause)] = answer
+    rows = iter_truth_answer_rows(document) if isinstance(document.get("scenarios"), Mapping) else iter_submission_answer_rows(document)
+    for scenario_id, clause, answer in rows:
+        answers[(scenario_id, clause)] = answer
     return answers
-
-
-def _iter_scenarios(value: Any):
-    if isinstance(value, Mapping):
-        if "scenario_id" in value:
-            yield value
-        for child in value.values():
-            yield from _iter_scenarios(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _iter_scenarios(child)

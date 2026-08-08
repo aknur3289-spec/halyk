@@ -28,6 +28,15 @@ def test_single_transaction_cap_returns_none_when_nothing_exceeds_threshold() ->
     assert find_single_transaction_evidence(100, transactions) is None
 
 
+def test_single_transaction_cap_uses_signed_debit_materiality() -> None:
+    transactions = [
+        {"txn_id": "qualifying-debit", "amount": -125, "date": "2026-04-02", "category": "fees"},
+        {"txn_id": "at-cap-debit", "amount": -100, "date": "2026-04-01", "category": "fees"},
+    ]
+
+    assert find_single_transaction_evidence(100, transactions) == "qualifying-debit"
+
+
 def test_counterfactual_returns_smallest_absolute_amount_that_resolves_breach() -> None:
     transactions = [
         {"txn_id": "large", "amount": 500, "date": "2026-01-01", "category": "fees"},

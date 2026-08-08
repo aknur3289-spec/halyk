@@ -28,7 +28,7 @@ def find_single_transaction_evidence(
     threshold: Decimal | int | float | str,
     candidate_transactions: Sequence[Transaction],
 ) -> TransactionId | None:
-    """Return the earliest transaction whose amount is strictly above *threshold*.
+    """Return the earliest transaction whose absolute amount exceeds *threshold*.
 
     Dates may be :class:`datetime.date`, :class:`datetime.datetime`, or ISO-8601
     strings.  When dates are equal, input order is retained, making the result
@@ -40,7 +40,10 @@ def find_single_transaction_evidence(
 
     for index, transaction in enumerate(candidate_transactions):
         amount = _to_decimal(_required(transaction, "amount"), field_name="amount")
-        if amount > normalized_threshold:
+        # Ledger debits are signed, while a cap concerns the transaction's
+        # materiality.  This matches aggregate and counterfactual evidence,
+        # which both operate on absolute transaction amounts.
+        if abs(amount) > normalized_threshold:
             qualifying.append((_to_date(_required(transaction, "date")), index, transaction))
 
     if not qualifying:

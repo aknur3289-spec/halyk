@@ -26,6 +26,7 @@ import math
 from pathlib import Path
 from typing import Any, TypeAlias
 
+from .schema import find_submission_answer, iter_submission_answer_rows
 from .utils import JsonFileError, read_json_object, write_json_atomically
 
 logger = logging.getLogger(__name__)
@@ -114,16 +115,19 @@ class SubmissionAssembler:
         /,
         **fields: JsonValue,
     ) -> "SubmissionAssembler":
-        """Update existing top-level ``metadata`` fields without changing its keys."""
+        """Update existing metadata fields without changing the template shape."""
 
         document = self._require_loaded()
         existing_metadata = document.get("metadata")
-        if not isinstance(existing_metadata, MutableMapping):
-            raise SubmissionError("Template must contain a top-level 'metadata' JSON object")
+        if isinstance(existing_metadata, MutableMapping):
+            allowed_keys = set(existing_metadata)
+        else:
+            existing_metadata = document
+            allowed_keys = {key for key in document if key != "answers"}
 
         updates = dict(metadata or {})
         updates.update(fields)
-        unknown_keys = set(updates).difference(existing_metadata)
+        unknown_keys = set(updates).difference(allowed_keys)
         if unknown_keys:
             unknown = ", ".join(sorted(unknown_keys))
             raise SubmissionError(f"Metadata keys are not present in the template: {unknown}")
@@ -138,19 +142,20 @@ class SubmissionAssembler:
         document = self._require_loaded()
         snapshot = self._require_snapshot()
         _ensure_no_keys_removed(snapshot, document)
-        for scenario in _find_scenarios(document):
-            scenario_id = scenario["scenario_id"]
-            for clause_name, answer in _iter_clause_answers(scenario):
-                try:
-                    _validate_answer(
-                        _required_string(answer, "status"),
-                        answer["actual"],
-                        answer["evidence_txn_id"],
-                    )
-                except (KeyError, SubmissionError) as exc:
-                    raise SubmissionError(
-                        f"Invalid answer for scenario {scenario_id!r}, clause {clause_name!r}: {exc}"
-                    ) from exc
+        rows = list(iter_submission_answer_rows(document))
+        if not rows:
+            raise SubmissionError("Submission must contain at least one answer object")
+        for scenario_id, clause_name, answer in rows:
+            try:
+                _validate_answer(
+                    _required_string(answer, "status"),
+                    answer["actual"],
+                    answer["evidence_txn_id"],
+                )
+            except (KeyError, SubmissionError) as exc:
+                raise SubmissionError(
+                    f"Invalid answer for scenario {scenario_id!r}, clause {clause_name!r}: {exc}"
+                ) from exc
         try:
             json.dumps(document, allow_nan=False)
         except (TypeError, ValueError) as exc:
@@ -173,14 +178,10 @@ class SubmissionAssembler:
     def _find_clause_answer(self, scenario_id: str | int, clause: str) -> MutableMapping[str, JsonValue]:
         """Find the mutable answer object addressed by a scenario and clause."""
 
-        for scenario in _find_scenarios(self._require_loaded()):
-            if scenario["scenario_id"] != scenario_id:
-                continue
-            for clause_name, answer in _iter_clause_answers(scenario):
-                if clause_name == clause:
-                    return answer
-            raise SubmissionError(f"Clause {clause!r} does not exist in scenario {scenario_id!r}")
-        raise SubmissionError(f"Scenario {scenario_id!r} does not exist in the template")
+        try:
+            return find_submission_answer(self._require_loaded(), scenario_id, clause)
+        except KeyError as exc:
+            raise SubmissionError(f"Unable to find answer for scenario {scenario_id!r}, clause {clause!r}") from exc
 
     def _require_loaded(self) -> dict[str, JsonValue]:
         if self._submission is None:
@@ -206,47 +207,6 @@ def _validate_answer(status: str, actual: Any, evidence_txn_id: Any) -> Submissi
 
     rounded_actual = float(Decimal(str(actual)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     return SubmissionAnswer(status=status, actual=rounded_actual, evidence_txn_id=evidence_txn_id)
-
-
-def _find_scenarios(document: Mapping[str, JsonValue]) -> list[MutableMapping[str, JsonValue]]:
-    """Find every object in a document that explicitly represents a scenario."""
-
-    scenarios: list[MutableMapping[str, JsonValue]] = []
-
-    def visit(value: JsonValue) -> None:
-        if isinstance(value, MutableMapping):
-            if "scenario_id" in value:
-                scenarios.append(value)
-            for nested_value in value.values():
-                visit(nested_value)
-        elif isinstance(value, list):
-            for nested_value in value:
-                visit(nested_value)
-
-    visit(document)
-    return scenarios
-
-
-def _iter_clause_answers(scenario: Mapping[str, JsonValue]) -> Sequence[tuple[str, MutableMapping[str, JsonValue]]]:
-    """Return named clause answer objects from one scenario."""
-
-    clauses = scenario.get("clauses")
-    if isinstance(clauses, MutableMapping):
-        answers: list[tuple[str, MutableMapping[str, JsonValue]]] = []
-        for name, answer in clauses.items():
-            if isinstance(name, str) and isinstance(answer, MutableMapping):
-                answers.append((name, answer))
-        return answers
-    if isinstance(clauses, list):
-        answers = []
-        for answer in clauses:
-            if not isinstance(answer, MutableMapping):
-                continue
-            name = answer.get("clause", answer.get("clause_id"))
-            if isinstance(name, str):
-                answers.append((name, answer))
-        return answers
-    raise SubmissionError("Scenario must contain 'clauses' as an object or a list")
 
 
 def _ensure_no_keys_removed(original: JsonValue, current: JsonValue, path: str = "$") -> None:
