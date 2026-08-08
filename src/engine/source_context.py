@@ -322,6 +322,36 @@ def _parse_accepted_auditor_addbacks(
                 value=float(match.group(1).replace(",", "")),
                 evidence=(SourceEvidence(document_id=filename, page=page, quote=match.group(0)),),
             )
+
+        # Some final Russian auditor reports disclose add-backs as an
+        # image-only table followed by an explicit materiality rule.
+        threshold_match = re.search(
+            r"разовым\w*\s+для\s+целей\s+ковенант\w*\s+призна\w*\s+стать\w*"
+            r"\s+в\s+сумме\s+не\s+менее\s+\$([\d,]+(?:\.\d+)?)"
+            r"[^.]{0,180}стать\w*\s+меньш\w*\s+сумм\w*[^.]{0,120}"
+            r"(?:не\s+прибавля|не\s+добавля)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if threshold_match:
+            threshold = float(threshold_match.group(1).replace(",", ""))
+            table_text = text[: threshold_match.start()]
+            amounts = [
+                float(value.replace(",", ""))
+                for value in re.findall(r"\$([\d,]+(?:\.\d+)?)", table_text)
+            ]
+            qualifying = [value for value in amounts if value >= threshold]
+            if qualifying:
+                return DocumentedLedgerInput(
+                    value=round(sum(qualifying), 2),
+                    evidence=(
+                        SourceEvidence(
+                            document_id=filename,
+                            page=page,
+                            quote=text.strip(),
+                        ),
+                    ),
+                )
     return None
 
 
