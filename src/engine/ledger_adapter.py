@@ -164,12 +164,19 @@ def _selector_covenant(covenant: CovenantSpec, selector: TransactionSelector) ->
     )
 
 
-def _metric_selection(
+def _selector_for_metric(
     covenant: CovenantSpec,
-    ledger: pd.DataFrame,
     metric: str,
     context: LedgerDerivationContext,
-) -> tuple[float, tuple[str, ...]]:
+) -> TransactionSelector:
+    """Build the canonical selector used for a ledger-derived metric.
+
+    Stage 3 selectors are evidence from the agreement and may be in Russian,
+    while the ledger narratives use the accounting vocabulary in English. The
+    adapter owns this source-grounded metric mapping; returning the selector
+    lets Stage 5 evaluate the same transactions that were compiled here.
+    """
+
     if metric == "related_party_payments":
         counterparties = context.related_parties.get(str(covenant.scenario_id))
         if not counterparties and covenant.transaction_selector is not None:
@@ -178,23 +185,58 @@ def _metric_selection(
             raise ValueError(
                 "related_party_payments requires counterparties from the scenario KYC record"
             )
-        selector = TransactionSelector(counterparties=list(counterparties), sign="debit")
-    elif metric == "transferred_capital_assets":
-        counterparties = context.related_parties.get(f"{covenant.scenario_id}:unrestricted_subsidiaries")
+        return TransactionSelector(counterparties=list(counterparties), sign="debit")
+    if metric == "transferred_capital_assets":
+        counterparties = context.related_parties.get(
+            f"{covenant.scenario_id}:unrestricted_subsidiaries"
+        )
         if not counterparties:
             raise ValueError(
                 "transferred_capital_assets requires unrestricted subsidiaries from KYC"
             )
-        selector = TransactionSelector(
+        return TransactionSelector(
             include_terms=["transfer"], counterparties=list(counterparties), sign="debit"
         )
-    else:
-        rule = _METRIC_RULES.get(metric)
-        if rule is None:
-            raise ValueError(f"No source-grounded ledger rule is registered for metric: {metric}")
-        selector = TransactionSelector(
-            include_terms=list(rule.include_terms), exclude_terms=list(rule.exclude_terms), sign=rule.sign
-        )
+
+    rule = _METRIC_RULES.get(metric)
+    if rule is None:
+        raise ValueError(f"No source-grounded ledger rule is registered for metric: {metric}")
+    return TransactionSelector(
+        include_terms=list(rule.include_terms),
+        exclude_terms=list(rule.exclude_terms),
+        sign=rule.sign,
+    )
+
+
+def _effective_selector(
+    covenant: CovenantSpec,
+    metric: str,
+    ledger: pd.DataFrame,
+    context: LedgerDerivationContext,
+) -> TransactionSelector:
+    """Prefer a source selector when it matches, otherwise use its rule.
+
+    Synthetic/legacy ledgers may already contain the literal selector from the
+    agreement (for example ``capex``). The public ledger uses the canonical
+    accounting narrative (for example ``purchase of ... equipment``). This
+    fallback preserves the former while supporting the latter.
+    """
+
+    source_selector = covenant.transaction_selector
+    if source_selector is not None:
+        source_selected = select_transactions(ledger, _selector_covenant(covenant, source_selector))
+        if not source_selected.empty:
+            return source_selector
+    return _selector_for_metric(covenant, metric, context)
+
+
+def _metric_selection(
+    covenant: CovenantSpec,
+    ledger: pd.DataFrame,
+    metric: str,
+    context: LedgerDerivationContext,
+) -> tuple[float, tuple[str, ...]]:
+    selector = _effective_selector(covenant, metric, ledger, context)
     selected = select_transactions(ledger, _selector_covenant(covenant, selector))
     return float(selected["amount"].abs().sum()), tuple(selected["txn_id"].tolist())
 
@@ -276,6 +318,28 @@ def compile_ledger_inputs(
 
     if required_metric != compiled.metric:
         compiled = compiled.model_copy(update={"metric": required_metric})
+
+    # These metrics are deterministic combinations of ledger/documented
+    # inputs assembled above. Expose the assembled value as a financial fact
+    # so EngineService does not discard it by re-running a raw ledger selector.
+    if compiled.metric in {"individual_overhead_line", "employee_obligation_expense"}:
+        compiled = compiled.model_copy(update={"calculation_kind": "financial_fact"})
+
+    # ``compile_ledger_inputs`` may have translated an evidence-grounded
+    # selector (for example Russian ``Капитальные затраты``) into the
+    # canonical ledger selector (``purchase of``).  Carry that exact selector
+    # into the covenant passed to EngineService; otherwise the second
+    # calculation would re-apply the untranslated source selector and report a
+    # false empty match.
+    if compiled.calculation_kind in {"ledger_aggregate", "single_transaction"}:
+        canonical_metric = _metric_from_source_label(compiled.metric) or compiled.metric
+        compiled = compiled.model_copy(
+            update={
+                "transaction_selector": _effective_selector(
+                    compiled, canonical_metric, ledger, context
+                )
+            }
+        )
 
     # Put native FinancialFacts fields back in their intended slots; all
     # additional ledger metrics remain in ``additional``.

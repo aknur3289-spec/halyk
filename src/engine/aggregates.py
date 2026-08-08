@@ -20,6 +20,8 @@ class LedgerAggregateCalculator(Calculator):
 
     def calculate(self, covenant, facts, ledger) -> CalculationOutput:
         selected = select_transactions(ledger, covenant)
+        if selected.empty:
+            raise ValueError("no ledger transactions matched the explicit covenant selector")
         return CalculationOutput(
             actual=float(selected["amount"].abs().sum()),
             candidate_transactions=selected["txn_id"].tolist(),

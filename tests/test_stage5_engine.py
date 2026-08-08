@@ -142,6 +142,15 @@ def test_engine_rejects_implicit_currency_conversion():
         EngineService.evaluate(capex_covenant(), FinancialFacts(), mixed_currency_ledger)
 
 
+def test_empty_ledger_selection_is_review_not_false_compliance():
+    covenant = capex_covenant(
+        transaction_selector={"include_terms": ["unmatched-term"], "sign": "debit"}
+    )
+
+    with pytest.raises(ValueError, match="no ledger transactions matched"):
+        EngineService.evaluate(covenant, FinancialFacts(), ledger())
+
+
 def test_trigger_ledger_calculation_requires_selector():
     with pytest.raises(ValueError, match="trigger requires transaction_selector"):
         CovenantSpec.model_validate(

@@ -52,7 +52,7 @@ class GroqJSON:
         for attempt in range(6):
             try:
                 response = self.client.chat.completions.create(
-                    model=self.model, temperature=0, max_tokens=1600,
+                    model=self.model, temperature=0, max_tokens=500,
                     response_format={"type": "json_object"},
                     messages=[{"role": "user", "content": prompt}],
                 )

@@ -10,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 
+from src.engine.evaluator import FinancialEngine
 from src.engine.service import EngineService
 from src.engine.ledger_adapter import LedgerDerivationContext, compile_ledger_inputs
 from src.engine.source_context import build_ledger_derivation_context
@@ -197,11 +198,44 @@ def _make_recompute_callback(
     """Recompute status only, using the deterministic engine as the single source of truth."""
 
     def recompute(remaining_transactions: Sequence[Mapping[str, Any]]) -> CovenantStatus:
-        frame = pd.DataFrame(list(remaining_transactions))
+        # ``pd.DataFrame([])`` has no columns.  That is a valid counterfactual
+        # (for example, removing the only transaction in a ledger aggregate),
+        # but the selector still needs the ledger schema to evaluate it.
+        # Preserve the original empty schema instead of turning this into a
+        # misleading "missing columns" error.
+        if remaining_transactions:
+            frame = pd.DataFrame(list(remaining_transactions))
+        else:
+            frame = ledger.iloc[0:0].copy()
+
+        # LedgerAggregateCalculator intentionally rejects an empty selection
+        # during the primary evaluation so source/selector mistakes cannot be
+        # hidden.  In a counterfactual, however, an empty selection is the
+        # exact result we are testing.  Its aggregate is mathematically zero,
+        # so evaluate that value directly and retain the operator semantics.
+        if not remaining_transactions and covenant.calculation_kind in {
+            "ledger_aggregate",
+            "single_transaction",
+        }:
+            return FinancialEngine.evaluate(
+                0.0, covenant.threshold, covenant.operator
+            ).status
+
         compiled = compile_ledger_inputs(covenant, facts, frame, context=context)
-        result = EngineService.evaluate(
-            compiled.covenant, compiled.facts, frame, scenario_id=covenant.scenario_id
-        )
+        try:
+            result = EngineService.evaluate(
+                compiled.covenant, compiled.facts, frame, scenario_id=covenant.scenario_id
+            )
+        except ValueError as exc:
+            # A counterfactual can remove the final transaction that supplied
+            # a ratio denominator.  The ratio is then undefined, not a
+            # compliant zero; retain the conservative breach status and let
+            # the resolver test the remaining candidates.
+            if covenant.calculation_kind == "ratio" and str(exc).startswith(
+                "ratio denominator "
+            ) and str(exc).endswith(" cannot be zero"):
+                return CovenantStatus.BREACH
+            raise
         return result.status
 
     return recompute

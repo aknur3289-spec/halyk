@@ -21,7 +21,35 @@ from pydantic import ValidationError
 from src.models import CovenantSpec, FinancialFactRecord, FinancialFacts, SourceEvidence
 
 
-SUPPORTED_FACT_METRICS = {"revenue", "ebitda", "debt", "equity", "cash"}
+SUPPORTED_FACT_METRICS = {
+    "revenue",
+    "ebitda",
+    "debt",
+    "equity",
+    "cash",
+    "debt_service",
+    "operating_cash_flow",
+    "interest_expense",
+    "capital_expenditure",
+    "operating_expenses",
+    "lease_payments",
+    "insurance_premiums",
+    "related_party_payments",
+    "personnel_expenses",
+    "utilities_expenses",
+    "taxes",
+    "financing_proceeds",
+    "adjusted_revenue",
+    "adjusted_ebitda",
+    "rent_and_utility_expenses",
+    "personnel_and_utility_expenses",
+    "taxes_and_utilities",
+    "transferred_capital_assets",
+    "capital_expenditures",
+    "operating_expenses_and_lease_payments",
+    "revenue_plus_financing_proceeds",
+    "operating_expenses_plus_capital_expenditures",
+}
 # These are calculation inputs that occur in the active loan agreements.  They
 # are deliberately not inferred from a keyword: the evidence and the explicit
 # calculation contract below still have to validate.  Keeping this vocabulary
@@ -44,6 +72,13 @@ SUPPORTED_COVENANT_METRICS = SUPPORTED_FACT_METRICS | {
     "assets_transferred_to_unrestricted_subsidiaries",
     "individual_overhead_line",
     "adjusted_revenue",
+    "capital_expenditure_to_ebitda",
+    "adjusted_ebitda_to_revenue",
+    "taxes_and_utilities_to_ebitda",
+    "capital_intensity",
+    "revenue_plus_financing_to_operating_and_capex",
+    "revenue_to_personnel_and_utilities",
+    "financing_proceeds_to_ebitda",
 }
 SUPPORTED_CALCULATORS = {"aggregate", "ratio", "transaction"}
 SUPPORTED_CALCULATION_KINDS = {
@@ -68,6 +103,9 @@ FACT_TERMS = re.compile(
     r"(?i)\b(revenue|turnover|income|ebitda|debt|borrowings|equity|cash|"
     r"выручка|доход|задолженность|долг|капитал|денежн\w*\s+средств\w*|"
     r"финансов\w*\s+результат\w*)\b"
+)
+FACT_VALUE_RE = re.compile(
+    r"(?i)(?:\$|US\$|USD|тенге|млн|миллион|million|тыс|thousand)|\b\d{3,}(?:[\s,]\d{3})*(?:\.\d+)?\b"
 )
 INACTIVE_DOCUMENT_RE = re.compile(
     r"(?i)(?:недействующ\w*\s+редакци\w*|не\s+применяется|superseded|obsolete|not\s+applicable)"
@@ -105,7 +143,7 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     temporary = path.with_suffix(f"{path.suffix}.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
     temporary.replace(path)
 
 
@@ -161,7 +199,24 @@ def load_context(parsed_path: Path, stage2_path: Path) -> list[dict[str, Any]]:
     output = []
     for document in documents:
         resolved = resolution.get(document["filename"], {})
-        output.append({**document, **{key: resolved.get(key) for key in ("account_id", "borrower_name", "scenario_id", "document_type", "final_status")}})
+        output.append(
+            {
+                **document,
+                **{
+                    key: resolved.get(key)
+                    for key in (
+                        "account_id",
+                        "borrower_name",
+                        "scenario_id",
+                        "document_type",
+                        "extraction_method",
+                        "resolution_status",
+                        "final_status",
+                        "reason",
+                    )
+                },
+            }
+        )
     return output
 
 
@@ -173,6 +228,11 @@ def page_candidates(document: dict[str, Any], *, kind: str) -> list[dict[str, An
     full-page requests that previously exhausted the provider's token budget.
     """
     if _is_inactive_document(document):
+        return []
+    document_type = document.get("document_type")
+    if kind == "covenant" and document_type and document_type not in {"loan_agreement", "amendment"}:
+        return []
+    if kind == "fact" and document_type and document_type not in {"financial_statement", "amendment"}:
         return []
     matcher = COVENANT_TERMS if kind == "covenant" else FACT_TERMS
     candidates: list[dict[str, Any]] = []
@@ -188,6 +248,8 @@ def page_candidates(document: dict[str, Any], *, kind: str) -> list[dict[str, An
         if kind == "covenant" and not COVENANT_CLAUSE_RE.search(text):
             continue
         if kind == "fact" and not matches:
+            continue
+        if kind == "fact" and not FACT_VALUE_RE.search(text):
             continue
         source_pages = [(page.get("page"), text)]
         source_text = _fact_context(text, matches) if kind == "fact" else _covenant_context(text)
@@ -307,6 +369,9 @@ def clause_candidates(
         scenario_id = document.get("scenario_id")
         if not scenario_id or _is_inactive_document(document):
             continue
+        document_type = document.get("document_type")
+        if document_type and document_type not in {"loan_agreement", "amendment"}:
+            continue
         pages = document.get("pages", [])
         for page_index, page in enumerate(pages):
             text = repair_mojibake((page.get("text") or "").strip())
@@ -327,6 +392,11 @@ def clause_candidates(
                 # The final clause can have its threshold on the next page.
                 if not end_candidates and page_index + 1 < len(pages):
                     continuation = repair_mojibake((pages[page_index + 1].get("text") or "").strip())
+                    # A new 6.x marker at the top of the next page starts the
+                    # following covenant; it is not continuation text for the
+                    # current clause.
+                    if COVENANT_CLAUSE_RE.search(continuation[:300]):
+                        continuation = ""
                     continuation_end = re.search(r"(?im)^\s*статья\s+7\b|^\s*article\s+7\b", continuation)
                     continuation = continuation[: continuation_end.start() if continuation_end else len(continuation)]
                     if continuation:
@@ -580,6 +650,8 @@ def normalise_covenant_item(
     """Normalize transport-level LLM formatting into CovenantSpec vocabulary."""
 
     normalised = dict(item)
+    if candidate and candidate.get("scenario_id"):
+        normalised["scenario_id"] = candidate["scenario_id"]
     normalised["metric"] = normalise_metric(normalised.get("metric", ""))
     normalised["operator"] = normalise_operator(normalised.get("operator", ""))
     normalised["currency"] = normalise_currency(normalised.get("currency"))
@@ -596,6 +668,182 @@ def normalise_covenant_item(
     )
     normalised["trigger"] = normalise_trigger(normalised.get("trigger"))
     return normalise_source_grounded_clause(normalised, candidate)
+
+
+def _rule_period(source_text: str) -> dict[str, str] | str | None:
+    dates = re.findall(r"20\d{2}-\d{2}-\d{2}", source_text)
+    if len(dates) >= 2:
+        start, end = sorted(dates[:2])
+        return {"start": start, "end": end}
+    return dates[0] if dates else None
+
+
+def _rule_threshold(source_text: str) -> tuple[float, str, re.Match[str]] | None:
+    money = list(
+        re.finditer(
+            r"(?i)(?:US\$|USD|\$)\s*([\d\s,]+(?:\.\d+)?)",
+            source_text,
+        )
+    )
+    ratios = list(re.finditer(r"(?<!\d)(\d+(?:\.\d+)?)\s*[xх]\b", source_text))
+    matches = [(match, "USD") for match in money] + [(match, "N/A") for match in ratios]
+    if not matches:
+        return None
+    match, currency = min(matches, key=lambda item: item[0].start())
+    raw_value = match.group(1).replace(" ", "").replace(",", "")
+    return float(raw_value), currency, match
+
+
+def _rule_operator(source_text: str, threshold_start: int) -> str:
+    context = source_text[:threshold_start].casefold()
+    context = context[-900:]
+    if re.search(r"не\s+(?:менее|ниже)|сниж\w*[^.]{0,80}\bниже\b|at\s+least", context):
+        return ">="
+    if re.search(
+        r"не\s+допуск|не\s+вправе|не\s+(?:превыш|более)|не\s+должн\w*\s+превыш|"
+        r"not\s+(?:exceed|more)|no\s+more",
+        context,
+    ):
+        return "<="
+    if re.search(r"\b(?:свыше|более|превыш\w*|exceed\w*)", context):
+        return ">"
+    return "<="
+
+
+def _rule_metric(source_text: str) -> tuple[str, str | None, str | None, str]:
+    """Infer only explicit ratio subjects; return metric, numerator, denominator, kind."""
+
+    text = source_text.casefold()
+    if "выруч" in text and "за вычетом" in text and "наибольш" in text:
+        return "adjusted_revenue", None, None, "financial_fact"
+    if "страхов" in text and "аренд" in text and "коммун" in text:
+        return "insurance_premiums", "insurance_premiums", "rent_and_utility_expenses", "ratio"
+    if "активов" in text and "передан" in text and "неограниченн" in text:
+        return (
+            "assets_transferred_to_unrestricted_subsidiaries",
+            "transferred_capital_assets",
+            "capital_expenditures",
+            "ratio",
+        )
+    if "финансирован" in text and "ebitda" in text and "отношен" in text:
+        return "financing_proceeds_to_ebitda", "financing_proceeds", "ebitda", "ratio"
+    if "налог" in text and "коммунальн" in text and "ebitda" in text:
+        return "taxes_and_utilities_to_ebitda", "taxes_and_utilities", "ebitda", "ratio"
+    if "капиталоёмк" in text or "капиталоемк" in text:
+        return "capital_intensity", "capital_expenditure", "operating_expenses_and_lease_payments", "ratio"
+    if "суммы выручки" in text and "поступлен" in text and "операцион" in text and "капитальн" in text:
+        return (
+            "revenue_plus_financing_to_operating_and_capex",
+            "revenue_plus_financing_proceeds",
+            "operating_expenses_plus_capital_expenditures",
+            "ratio",
+        )
+    if "персонал" in text and "коммунальн" in text and "выруч" in text:
+        return "revenue_to_personnel_and_utilities", "revenue", "personnel_and_utility_expenses", "ratio"
+    if "капитальн" in text and "ebitda" in text:
+        return "capital_expenditure_to_ebitda", "capital_expenditure", "ebitda", "ratio"
+    if "процент" in text and "ebitda" in text and "отношен" in text:
+        return "dscr", "ebitda", "interest_expense", "ratio"
+    if "накладн" in text and "отдельн" in text:
+        return "individual_overhead_line", None, None, "ledger_aggregate"
+    if "ebitda" in text and "выруч" in text and "отношен" in text:
+        return "adjusted_ebitda_to_revenue", "adjusted_ebitda", "revenue", "ratio"
+    if "ebitda" in text and ("отношен" in text or "коэффициент" in text):
+        return "debt_to_ebitda", "debt", "ebitda", "ratio"
+    if "связ" in text or "аффилирован" in text or "related-party" in text:
+        if "выруч" in text and "x" in text:
+            return "related_party_payments", "related_party_payments", "revenue", "ratio"
+        if "операцион" in text and "x" in text:
+            return "related_party_payments", "related_party_payments", "operating_expenses", "ratio"
+        return "related_party_payments", None, None, "ledger_aggregate"
+    if "капитальн" in text:
+        return "capital_expenditure", None, None, "ledger_aggregate"
+    if "персонал" in text or "накладн" in text:
+        return "personnel_expenses", None, None, "ledger_aggregate"
+    if "выруч" in text or "оборот" in text:
+        return "revenue", None, None, "financial_fact"
+    if "денежн" in text and "средств" in text:
+        return "cash", None, None, "financial_fact"
+    if "задолжен" in text or "долг" in text:
+        return "debt", None, None, "financial_fact"
+    return "", None, None, "financial_fact"
+
+
+def rule_based_covenant_item(candidate: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract unambiguous covenant subjects before invoking an LLM.
+
+    This intentionally handles only explicit clause text and source numbers. A
+    candidate that cannot be mapped to an engine metric remains an LLM/review
+    item instead of receiving a guessed rule.
+    """
+
+    source_text = str(candidate.get("text") or "")
+    threshold = _rule_threshold(source_text)
+    if threshold is None:
+        return None
+    value, currency, threshold_match = threshold
+    metric, numerator, denominator, calculation_kind = _rule_metric(source_text)
+    if not metric:
+        return None
+    period = _rule_period(source_text)
+    item: dict[str, Any] = {
+        "clause": candidate["clause"],
+        "metric": metric,
+        "category": metric,
+        "calculation_kind": calculation_kind,
+        "operator": _rule_operator(source_text, threshold_match.start()),
+        "threshold": value,
+        "currency": currency,
+        "period": period,
+        "transaction_selector": None,
+        "ratio_numerator": numerator,
+        "ratio_denominator": denominator,
+        "trigger": None,
+        "exclusions": [],
+        "quote": " ".join(source_text[: threshold_match.end()].split()),
+        "confidence": 1.0,
+    }
+    if calculation_kind == "ledger_aggregate":
+        selector_terms: list[str] = []
+        if metric == "capital_expenditure":
+            selector_terms = [term for term in ("Капитальные затраты", "capital expenditures") if term in source_text]
+        elif metric == "personnel_expenses":
+            selector_terms = [term for term in ("оплату труда", "накладных расходов", "personnel expenses", "overhead") if term in source_text]
+        elif metric == "individual_overhead_line":
+            selector_terms = [term for term in ("накладных расходов", "overhead") if term in source_text]
+        elif metric == "related_party_payments":
+            selector_terms = [term for term in ("платеж", "payments", "перечислять") if term in source_text]
+            counterparties = _kyc_related_counterparties(candidate.get("related_party_reference", ""))
+            if counterparties:
+                item["transaction_selector"] = {
+                    "include_terms": [],
+                    "exclude_terms": [],
+                    "counterparties": counterparties,
+                    "sign": "debit",
+                }
+        if item["transaction_selector"] is None:
+            if not selector_terms:
+                return None
+            item["transaction_selector"] = {
+                "include_terms": selector_terms,
+                "exclude_terms": [],
+                "counterparties": [],
+                "sign": "debit",
+            }
+    # A springing covenant carries an explicit activation threshold. Preserve
+    # it as a trigger rather than creating a second synthetic clause.
+    trigger_match = re.search(
+        r"(?i)(?:при условии|только при условии)[^$.]{0,220}?(?:US\$|USD|\$)\s*([\d\s,]+(?:\.\d+)?)",
+        source_text,
+    )
+    if trigger_match:
+        item["trigger"] = {
+            "metric": "financing_proceeds",
+            "calculation_kind": "financial_fact",
+            "operator": ">",
+            "threshold": float(trigger_match.group(1).replace(" ", "").replace(",", "")),
+        }
+    return item
 
 
 def reprocess_covenant_errors(
@@ -712,12 +960,16 @@ class GroqExtractor:
     """Small JSON-only Groq client with disk caching and retry handling."""
 
     provider_name = "Groq"
+    DEFAULT_MAX_TOKENS = 500
 
-    def __init__(self, cache_dir: Path, model: str) -> None:
+    def __init__(self, cache_dir: Path, model: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> None:
         # Defer API-key validation to `ask()` so that cache-only and
         # fallback-only runs (no live LLM calls) work without a key.
         self._api_key = os.getenv("GROQ_API_KEY")
         self.model = model
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        self.max_tokens = max_tokens
         self.cache_dir = cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.client: Any = None  # lazily initialised on first live API call
@@ -756,6 +1008,7 @@ class GroqExtractor:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     temperature=0,
+                    max_tokens=self.max_tokens,
                     response_format={"type": "json_object"},
                     messages=[{"role": "user", "content": prompt}],
                 )
@@ -784,9 +1037,10 @@ class CerebrasExtractor(GroqExtractor):
         cache_dir: Path,
         model: str,
         *,
+        max_tokens: int = GroqExtractor.DEFAULT_MAX_TOKENS,
         client_factory: Any | None = None,
     ) -> None:
-        super().__init__(cache_dir, model)
+        super().__init__(cache_dir, model, max_tokens=max_tokens)
         self._api_key = os.getenv("CEREBRAS_API_KEY")
         self._client_factory = client_factory
 
@@ -854,7 +1108,7 @@ def fact_prompt(candidate: dict[str, Any]) -> str:
     return f'''Extract reported financial facts from SOURCE. Return only a valid json object:
 {{"facts":[{{"metric":"", "value":0.0, "currency":"", "period":"", "value_type":"reported", "quote":"", "confidence":0.0}}]}}
 
-Allowed metric values only: revenue, ebitda, debt, equity, cash.
+Allowed metric values only: {", ".join(sorted(SUPPORTED_FACT_METRICS))}.
 Use a number for value and normalize million/thousand units. Extract only explicitly reported values, not covenant thresholds.
 quote must be an exact, short substring from SOURCE. If none exist, return {{"facts":[]}}.
 
@@ -980,7 +1234,12 @@ def run_selected_covenant_extraction(
     errors: list[dict[str, Any]] = []
     for candidate in clause_candidates(documents, required_keys):
         try:
-            payload = extractor.ask(single_clause_covenant_prompt(candidate))
+            payload = None
+            rule_item = rule_based_covenant_item(candidate)
+            if rule_item is not None:
+                payload = {"covenants": [rule_item]}
+            else:
+                payload = extractor.ask(single_clause_covenant_prompt(candidate))
             for raw_item in payload.get("covenants", []):
                 item = normalise_covenant_item(
                     dict(raw_item),
@@ -1133,9 +1392,49 @@ def run_fact_extraction(documents: list[dict[str, Any]], extractor: GroqExtracto
                             }
                         )
                         continue
-                    facts_by_scenario[scenario_id][metric] = float(item["value"])
-                    evidence.append({"scenario_id": scenario_id, "document_id": candidate["filename"], "source_type": "financial_fact", "metric": metric, "value": float(item["value"]), "currency": item.get("currency", "N/A"), "period": item.get("period", "unspecified"), "value_type": item.get("value_type", "reported"), "page": candidate["page"], "quote": quote, "confidence": item.get("confidence")})
-            except (RuntimeError, ValidationError, ValueError) as exc:
+                    value_type = str(item.get("value_type", "reported")).strip().lower()
+                    if value_type not in {"audited", "reported", "management", "forecast"}:
+                        value_type = "reported"
+                    source_priority = {
+                        "audited": 1,
+                        "reported": 2,
+                        "management": 3,
+                        "forecast": 4,
+                    }[value_type]
+                    record = FinancialFactRecord.model_validate(
+                        {
+                            "scenario_id": scenario_id,
+                            "metric": metric,
+                            "value": float(item["value"]),
+                            "currency": normalise_currency(item.get("currency")),
+                            "period": item.get("period") or "unspecified",
+                            "value_type": value_type,
+                            "source_priority": source_priority,
+                            "evidence": {
+                                "document_id": candidate["filename"],
+                                "page": candidate["page"],
+                                "quote": quote,
+                            },
+                        }
+                    )
+                    candidates_by_key[(scenario_id, metric)].append(record)
+                    evidence.append(
+                        {
+                            "scenario_id": scenario_id,
+                            "document_id": candidate["filename"],
+                            "source_type": "financial_fact",
+                            "metric": metric,
+                            "value": float(item["value"]),
+                            "currency": record.currency,
+                            "period": record.period,
+                            "value_type": value_type,
+                            "source_priority": source_priority,
+                            "page": candidate["page"],
+                            "quote": quote,
+                            "confidence": item.get("confidence"),
+                        }
+                    )
+            except (RuntimeError, ValidationError, ValueError, TypeError, KeyError) as exc:
                 if isinstance(exc, RateLimitReached):
                     errors.append({"candidate": candidate, "reason": str(exc), "run_stopped": "rate_limit"})
                     return _resolve_fact_candidates(account_by_scenario, candidates_by_key, evidence, errors)
@@ -1166,6 +1465,10 @@ def _resolve_fact_candidates(account_by_scenario, candidates_by_key, evidence, e
             })
     rows = []
     for scenario_id in sorted(account_by_scenario):
-        model = FinancialFacts.model_validate(resolved.get(scenario_id, {}))
+        values = resolved.get(scenario_id, {})
+        known_fields = set(FinancialFacts.model_fields) - {"additional"}
+        payload = {key: value for key, value in values.items() if key in known_fields}
+        payload["additional"] = {key: value for key, value in values.items() if key not in known_fields}
+        model = FinancialFacts.model_validate(payload)
         rows.append({"scenario_id": scenario_id, "account_id": account_by_scenario[scenario_id], "financial_facts": model.model_dump()})
     return rows, evidence, errors

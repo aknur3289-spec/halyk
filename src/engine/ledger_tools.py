@@ -30,6 +30,24 @@ def canonical_currency(value: str) -> str:
     return _CURRENCY_ALIASES.get(cleaned, cleaned)
 
 
+def canonical_counterparty(value: str) -> str:
+    """Normalize legal-name punctuation for exact entity matching.
+
+    Source documents and the ledger may format the same legal entity as
+    ``Ertis Capital, LLP``, ``Ertis Capital LLP`` or ``Ertis Capital L.L.P.``.
+    This removes only punctuation/spacing differences; it does not perform
+    fuzzy or token-subset matching.
+    """
+
+    normalized = re.sub(r"[^\w]+", " ", str(value).casefold(), flags=re.UNICODE)
+    normalized = " ".join(normalized.split())
+    # ``L.L.P.`` becomes ``l l p`` after punctuation removal; collapse the
+    # legal suffix so it compares equal to the ledger's ``LLP`` spelling.
+    normalized = re.sub(r"\bl\s+l\s+p\b", "llp", normalized)
+    normalized = re.sub(r"\bl\s+l\s+c\b", "llc", normalized)
+    return normalized
+
+
 def as_dataframe(ledger: Any) -> pd.DataFrame:
     if isinstance(ledger, pd.DataFrame):
         return ledger.copy()
@@ -104,10 +122,12 @@ def select_transactions(ledger: Any, covenant) -> pd.DataFrame:
         frame = frame.loc[~excluded]
 
     if selector.counterparties and not frame.empty:
-        counterparties = frame["counterparty"].fillna("").str.casefold()
+        counterparties = frame["counterparty"].fillna("").map(canonical_counterparty)
         allowed = pd.Series(False, index=frame.index)
         for counterparty in selector.counterparties:
-            allowed |= counterparties.str.contains(re.escape(counterparty.casefold()), regex=True)
+            canonical = canonical_counterparty(counterparty)
+            if canonical:
+                allowed |= counterparties.str.contains(re.escape(canonical), regex=True)
         frame = frame.loc[allowed]
 
     if selector.sign == "debit":

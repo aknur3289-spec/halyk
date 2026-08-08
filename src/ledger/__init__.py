@@ -7,6 +7,7 @@ from .evidence_resolver import (
 )
 from .models import CovenantStatus, EvidenceAlgorithm, PipelineConfig, StageFiveResult
 from .pipeline import PipelineResult, SubmissionPipeline
+from .service import LedgerService
 from .submission_assembler import SubmissionAssembler, SubmissionError
 from .scorer import ScoreResult, ScoringError, score_submission
 from .validator import ValidationResult, validate_submission
@@ -28,4 +29,5 @@ __all__ = [
     "StageFiveResult",
     "PipelineResult",
     "SubmissionPipeline",
+    "LedgerService",
 ]
