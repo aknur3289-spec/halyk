@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 from pydantic import ValidationError
 
-from src.models import CovenantSpec, FinancialFacts
+from src.models import CovenantSpec, FinancialFactRecord, FinancialFacts, SourceEvidence
 
 
 SUPPORTED_FACT_METRICS = {"revenue", "ebitda", "debt", "equity", "cash"}
@@ -71,7 +71,7 @@ def load_context(parsed_path: Path, stage2_path: Path) -> list[dict[str, Any]]:
     output = []
     for document in documents:
         resolved = resolution.get(document["filename"], {})
-        output.append({**document, **{key: resolved.get(key) for key in ("account_id", "borrower_name", "scenario_id")}})
+        output.append({**document, **{key: resolved.get(key) for key in ("account_id", "borrower_name", "scenario_id", "document_type", "final_status")}})
     return output
 
 
@@ -231,13 +231,12 @@ def run_covenant_extraction(documents: list[dict[str, Any]], extractor: GroqExtr
 
 
 def run_fact_extraction(documents: list[dict[str, Any]], extractor: GroqExtractor) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    facts_by_scenario: dict[str, dict[str, float]] = defaultdict(dict)
+    candidates_by_key: dict[tuple[str, str], list[FinancialFactRecord]] = defaultdict(list)
     evidence: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     account_by_scenario: dict[str, str | None] = {}
     for document in documents:
         if document.get("scenario_id"):
-            facts_by_scenario.setdefault(document["scenario_id"], {})
             account_by_scenario[document["scenario_id"]] = document.get("account_id")
     for document in documents:
         scenario_id = document.get("scenario_id")
@@ -252,19 +251,47 @@ def run_fact_extraction(documents: list[dict[str, Any]], extractor: GroqExtracto
                     if metric not in SUPPORTED_FACT_METRICS or not quote:
                         errors.append({"candidate": candidate, "item": item, "reason": "unsupported metric or ungrounded quote"})
                         continue
-                    facts_by_scenario[scenario_id][metric] = float(item["value"])
-                    evidence.append({"scenario_id": scenario_id, "document_id": candidate["filename"], "source_type": "financial_fact", "metric": metric, "value": float(item["value"]), "currency": item.get("currency", "N/A"), "period": item.get("period", "unspecified"), "value_type": item.get("value_type", "reported"), "page": candidate["page"], "quote": quote, "confidence": item.get("confidence")})
+                    value_type = item.get("value_type", "reported")
+                    priority = {"audited": 1, "reported": 2, "management": 3, "forecast": 4}.get(value_type, 2)
+                    record = FinancialFactRecord.model_validate({
+                        "scenario_id": scenario_id, "metric": metric, "value": float(item["value"]),
+                        "currency": item.get("currency") or "N/A", "period": item.get("period") or "unspecified",
+                        "value_type": value_type, "source_priority": priority,
+                        "evidence": SourceEvidence(document_id=candidate["filename"], page=candidate["page"], quote=quote),
+                    })
+                    candidates_by_key[(scenario_id, metric)].append(record)
+                    evidence.append(record.model_dump(mode="json"))
             except (RuntimeError, ValidationError, ValueError) as exc:
                 if isinstance(exc, RateLimitReached):
                     errors.append({"candidate": candidate, "reason": str(exc), "run_stopped": "rate_limit"})
-                    rows = [
-                        {"scenario_id": key, "account_id": account_by_scenario[key], "financial_facts": FinancialFacts.model_validate(values).model_dump()}
-                        for key, values in facts_by_scenario.items()
-                    ]
-                    return rows, evidence, errors
+                    return _resolve_fact_candidates(account_by_scenario, candidates_by_key, evidence, errors)
                 errors.append({"candidate": candidate, "reason": str(exc)})
+    return _resolve_fact_candidates(account_by_scenario, candidates_by_key, evidence, errors)
+
+
+def _resolve_fact_candidates(account_by_scenario, candidates_by_key, evidence, errors):
+    resolved: dict[str, dict[str, float]] = defaultdict(dict)
+    for (scenario_id, metric), records in candidates_by_key.items():
+        # Audited/reported sources win; within the same class retain the latest
+        # period. Every losing candidate remains in evidence and is reported.
+        best_priority = min(record.source_priority for record in records)
+        ranked = sorted(
+            (record for record in records if record.source_priority == best_priority),
+            key=lambda record: str(record.period),
+            reverse=True,
+        )
+        winner = ranked[0]
+        resolved[scenario_id][metric] = winner.value
+        distinct = {record.value for record in records}
+        if len(distinct) > 1:
+            errors.append({
+                "scenario_id": scenario_id, "metric": metric, "status": "conflict_resolved",
+                "selected": winner.model_dump(mode="json"),
+                "candidates": [record.model_dump(mode="json") for record in records],
+                "reason": "selected by audited status/source priority; all candidates preserved",
+            })
     rows = []
-    for scenario_id, values in facts_by_scenario.items():
-        model = FinancialFacts.model_validate(values)
+    for scenario_id in sorted(account_by_scenario):
+        model = FinancialFacts.model_validate(resolved.get(scenario_id, {}))
         rows.append({"scenario_id": scenario_id, "account_id": account_by_scenario[scenario_id], "financial_facts": model.model_dump()})
     return rows, evidence, errors
