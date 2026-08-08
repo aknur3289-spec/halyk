@@ -79,9 +79,18 @@ def build_ledger_derivation_context(
             text,
             flags=re.IGNORECASE,
         )
-        if account_match is None:
+        account_value = account_match.group(1) if account_match else None
+        if account_value is None:
+            # OCR can distort the Russian account label (for example
+            # ``Счёт`` -> ``Cuér``) while preserving the authoritative
+            # ``ACC-*`` identifier. Accept a fallback only when the document
+            # contains exactly one account ID, avoiding ambiguous joins.
+            account_ids = sorted(set(re.findall(r"\bACC-\d+\b", text, flags=re.IGNORECASE)))
+            if len(account_ids) == 1:
+                account_value = account_ids[0]
+        if account_value is None:
             continue
-        scenario_id = scenario_by_account.get(account_match.group(1).upper())
+        scenario_id = scenario_by_account.get(account_value.upper())
         if scenario_id is None:
             continue
 
@@ -301,7 +310,29 @@ def _parse_unrestricted_subsidiaries(text: str) -> list[str]:
         flags=re.IGNORECASE,
     )
     if match is None:
-        return []
+        # KYC may disclose the status through a collateral-perimeter table:
+        # subsidiaries below an explicit pledged-assets percentage are
+        # declared unrestricted. Parse only rows from that table; ownership
+        # percentages from the related-party table must not be reused.
+        threshold_match = re.search(
+            r"дочерн\w*\s+организац\w*[^.]{0,220}?"
+            r"(?:ниже|менее)\s+(\d+(?:\.\d+)?)%[^.]{0,180}?"
+            r"(?:неограниченн\w*)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if threshold_match is None:
+            return []
+        threshold = float(threshold_match.group(1))
+        table_start = text.casefold().find("дочерняя организация")
+        table_text = text[table_start : threshold_match.start()] if table_start >= 0 else text[: threshold_match.start()]
+        result: list[str] = []
+        for name, pledged in re.findall(
+            r"(?m)^\s*([^\n%]+?)\s+(\d+(?:\.\d+)?)%\s*$", table_text
+        ):
+            if float(pledged) < threshold:
+                result.append(name.strip(" \t\"'«»"))
+        return result
     return [name.strip() for name in match.group(1).split(",") if name.strip()]
 
 
