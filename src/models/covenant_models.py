@@ -107,13 +107,22 @@ class CovenantSpec(BaseModel):
             raise ValueError("clause must be exactly one of: 6.1, 6.2, 6.3")
         return normalised
 
-    @field_validator("metric", "currency")
+    @field_validator("metric")
     @classmethod
-    def normalise_strings(cls, value: str) -> str:
+    def normalise_metric_string(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("value must not be blank")
-        return value.lower() if value != "N/A" else value
+        return value.lower()
+
+    @field_validator("currency")
+    @classmethod
+    def normalise_currency_string(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value must not be blank")
+        aliases = {"$": "USD", "US$": "USD", "N/A": "N/A", "UNSPECIFIED": "N/A"}
+        return aliases.get(value.upper(), value.upper())
 
     @model_validator(mode="after")
     def resolve_legacy_calculator(self) -> "CovenantSpec":

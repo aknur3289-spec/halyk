@@ -9,6 +9,13 @@ from pathlib import Path
 from src.extraction.pipeline import create_extractor, load_context, run_fact_extraction, write_jsonl
 
 
+class OfflineExtractor:
+    """Fail closed for unresolved facts without making network calls."""
+
+    def ask(self, _: str) -> dict:
+        raise RuntimeError("offline mode: no live LLM fallback is enabled")
+
+
 def create_stage4_extractor(output_dir: Path, provider: str, model: str | None):
     """Create the configured Stage 4 provider with its isolated response cache."""
 
@@ -24,10 +31,15 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs_regenerated"))
     parser.add_argument("--provider", choices=("groq", "cerebras"), default="groq")
     parser.add_argument("--model", default=None)
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use deterministic extraction only and record unresolved facts without network calls.",
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(exist_ok=True)
 
-    extractor = create_stage4_extractor(args.output_dir, args.provider, args.model)
+    extractor = OfflineExtractor() if args.offline else create_stage4_extractor(args.output_dir, args.provider, args.model)
     facts, evidence, errors = run_fact_extraction(load_context(args.parsed, args.stage2), extractor)
     write_jsonl(args.output_dir / "financial_facts.jsonl", facts)
     write_jsonl(args.output_dir / "financial_fact_evidence.jsonl", evidence)
