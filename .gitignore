@@ -1,0 +1,17 @@
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+
+# Python and editor/runtime by-products
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Provider caches and generated pipeline artifacts
+.groq_cache/
+.cerebras_cache/
+outputs*/
+submission.json
+*.log

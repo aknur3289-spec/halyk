@@ -1,7 +1,7 @@
 import re
 import pandas as pd
 
-TXN_PATTERN = re.compile(r"^TXN-([A-Z0-9]+)-\d+$")
+TXN_PATTERN = re.compile(r"^(?:TXN-)?([A-Z0-9]+)(?:-[A-Z]+)?-\d+$")
 
 def extract_scenario_id(txn_id: str) -> str:
     match = TXN_PATTERN.match(txn_id)

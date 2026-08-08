@@ -11,6 +11,25 @@ import pandas as pd
 from src.models import DateRange, TransactionSelector
 
 
+_CURRENCY_ALIASES = {
+    "$": "USD",
+    "US$": "USD",
+    "USD": "USD",
+    "UNSPECIFIED": "N/A",
+}
+
+
+def canonical_currency(value: str) -> str:
+    """Return a comparison-safe ISO currency for supported source aliases.
+
+    ``$`` in an agreement denotes USD in the public ledger.  This is an alias,
+    not a foreign-exchange conversion, so no rate is applied here.
+    """
+
+    cleaned = value.strip().upper()
+    return _CURRENCY_ALIASES.get(cleaned, cleaned)
+
+
 def as_dataframe(ledger: Any) -> pd.DataFrame:
     if isinstance(ledger, pd.DataFrame):
         return ledger.copy()
@@ -35,6 +54,12 @@ def parse_period(period: DateRange | str | None) -> DateRange | None:
             start=date(int(match.group(1)), int(match.group(2)), int(match.group(3))),
             end=date(int(match.group(4)), int(match.group(5)), int(match.group(6))),
         )
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"Unsupported period format: {period!r}") from exc
+        return DateRange(start=parsed, end=parsed)
     match = re.fullmatch(r"FY?(\d{4})", value, flags=re.IGNORECASE)
     if match:
         year = int(match.group(1))
@@ -90,16 +115,16 @@ def select_transactions(ledger: Any, covenant) -> pd.DataFrame:
     elif selector.sign == "credit":
         frame = frame.loc[frame["amount"] > 0]
 
-    if covenant.currency.upper() != "N/A" and not frame.empty:
-        requested_currency = covenant.currency.upper()
-        currencies = set(frame["currency"].str.upper())
+    if canonical_currency(covenant.currency) != "N/A" and not frame.empty:
+        requested_currency = canonical_currency(covenant.currency)
+        currencies = set(frame["currency"].map(canonical_currency))
         foreign_currencies = currencies - {requested_currency}
         if foreign_currencies:
             raise ValueError(
                 "Currency conversion is required for selected transactions: "
                 f"{sorted(foreign_currencies)} -> {requested_currency}"
             )
-        frame = frame.loc[frame["currency"].str.upper() == requested_currency]
+        frame = frame.loc[frame["currency"].map(canonical_currency) == requested_currency]
     return frame.reset_index(drop=True)
 
 

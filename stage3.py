@@ -6,112 +6,100 @@ import argparse
 import json
 from pathlib import Path
 
-from src.extraction.covenants import run
-from src.engine.stage5 import expected_cells, load_covenants
-
-
-def default_template() -> Path:
-    candidates = [Path("submission_template.json"), Path("6a741640c31eb032062683/agentic-bank-public/submission_template.json")]
-    for path in candidates:
-        if path.exists():
-            return path
-    raise FileNotFoundError("submission_template.json was not found")
-
-
-def validate_for_stage5(template: Path, covenant_file: Path, coverage_file: Path) -> dict:
-    """Validate Stage 3 output with the exact loader used by Stage 5."""
-    required = expected_cells(template)
-    loaded, errors = load_covenants(covenant_file)
-    required_set = set(required)
-    loaded_set = set(loaded)
-    summary = {
-        "expected_cells": len(required),
-        "validated_cells": len(loaded_set & required_set),
-        "coverage_gaps": len(required_set - loaded_set),
-        "input_errors": len(errors),
-        "unexpected_cells": [
-            {"scenario_id": scenario_id, "clause": clause}
-            for scenario_id, clause in sorted(loaded_set - required_set)
-        ],
-        "stage5_ready": not errors and loaded_set == required_set,
-        "cells": [
-            {
-                "scenario_id": scenario_id,
-                "clause": clause,
-                "status": "validated" if (scenario_id, clause) in loaded_set else "needs_review",
-            }
-            for scenario_id, clause in required
-        ],
-        "errors": errors,
-    }
-    coverage_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    return summary
-
-
-def simplified_period(value) -> str | None:
-    """Convert an engine period to the simple Stage 3 JSON representation."""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    start = getattr(value, "start", None)
-    end = getattr(value, "end", None)
-    if start is not None and end is not None:
-        return f"{start.isoformat()}/{end.isoformat()}"
-    return str(value)
-
-
-def write_simplified_results(covenant_file: Path, output_file: Path) -> int:
-    """Write the six-field Stage 3 view requested by the Person 1 contract."""
-    loaded, _ = load_covenants(covenant_file)
-    rows = []
-    for key in sorted(loaded):
-        covenant = loaded[key]
-        rows.append(
-            {
-                "clause": covenant.clause,
-                "metric": covenant.metric,
-                "operator": covenant.operator,
-                "threshold": covenant.threshold,
-                "currency": covenant.currency,
-                "period": simplified_period(covenant.period),
-            }
-        )
-    output_file.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    return len(rows)
+from src.extraction.pipeline import (
+    create_extractor,
+    load_context,
+    load_jsonl_rows,
+    merge_covenant_evidence,
+    merge_covenant_rows,
+    reprocess_covenant_errors,
+    recover_covenants_from_cache,
+    run_covenant_extraction,
+    run_selected_covenant_extraction,
+    unresolved_covenant_errors,
+    write_jsonl,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--parsed", type=Path, default=Path("parsed_documents.json"))
     parser.add_argument("--stage2", type=Path, default=Path("stage2_results.json"))
-    parser.add_argument("--template", type=Path, default=None)
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
-    parser.add_argument("--model", default="openai/gpt-oss-120b")
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs_regenerated"))
+    parser.add_argument("--provider", choices=("groq", "cerebras"), default="groq")
+    parser.add_argument("--model", default=None)
     parser.add_argument(
-        "--validate-only",
+        "--recover-cache-only",
         action="store_true",
-        help="validate existing covenants.jsonl with Stage 5 without calling Groq",
+        help="Restore unambiguous source-grounded rows from cache without live API calls.",
     )
     args = parser.parse_args()
-    template = args.template or default_template()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    covenant_file = args.output_dir / "covenants.jsonl"
-    if not args.validate_only:
-        run(args.parsed, args.stage2, template, args.output_dir, args.model)
+    args.output_dir.mkdir(exist_ok=True)
+    model = args.model or ("gpt-oss-120b" if args.provider == "cerebras" else "openai/gpt-oss-120b")
+    cache_dir = args.output_dir / (".cerebras_cache" if args.provider == "cerebras" else ".groq_cache")
 
-    coverage = validate_for_stage5(template, covenant_file, args.output_dir / "stage3_coverage.json")
-    simplified_count = write_simplified_results(
-        covenant_file,
-        args.output_dir / "stage3_results.json",
+    existing_covenants = load_jsonl_rows(args.output_dir / "covenants.jsonl")
+    existing_evidence = load_jsonl_rows(args.output_dir / "covenant_evidence.jsonl")
+    previous_errors = load_jsonl_rows(args.output_dir / "stage3_errors.jsonl")
+    replayed_covenants, replayed_evidence, remaining_previous_errors = reprocess_covenant_errors(
+        previous_errors
+    )
+    existing_covenants = merge_covenant_rows(existing_covenants, replayed_covenants)
+    existing_evidence = merge_covenant_evidence(existing_evidence, replayed_evidence)
+    documents = load_context(args.parsed, args.stage2)
+    extractor = create_extractor(args.provider, cache_dir, model)
+    recovered, recovered_evidence, recovery_errors = recover_covenants_from_cache(
+        documents,
+        cache_dir,
+        model,
+    )
+    if args.recover_cache_only:
+        merged_covenants = merge_covenant_rows(existing_covenants, recovered)
+        merged_evidence = merge_covenant_evidence(existing_evidence, recovered_evidence)
+        write_jsonl(args.output_dir / "covenants.jsonl", merged_covenants)
+        write_jsonl(args.output_dir / "covenant_evidence.jsonl", merged_evidence)
+        (args.output_dir / "stage3_results.json").write_text(
+            json.dumps(merged_covenants, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"Stage 3 cache recovery complete: {len(merged_covenants)} covenants; {len(recovery_errors)} review/error records.")
+        return
+
+    merged_covenants = merge_covenant_rows(existing_covenants, recovered)
+    merged_evidence = merge_covenant_evidence(existing_evidence, recovered_evidence)
+    completed_keys = {
+        (str(row["scenario_id"]), row["covenant"]["clause"])
+        for row in merged_covenants
+    }
+    expected_keys = {
+        (str(document["scenario_id"]), clause)
+        for document in documents
+        if document.get("scenario_id")
+        for clause in ("6.1", "6.2", "6.3")
+    }
+    covenants, evidence, errors = run_selected_covenant_extraction(
+        documents,
+        expected_keys.difference(completed_keys),
+        extractor,
+    )
+    merged_covenants = merge_covenant_rows(merged_covenants, covenants)
+    merged_evidence = merge_covenant_evidence(merged_evidence, evidence)
+    final_completed_keys = {
+        (str(row["scenario_id"]), row["covenant"]["clause"])
+        for row in merged_covenants
+    }
+    remaining_errors = unresolved_covenant_errors(
+        [*remaining_previous_errors, *recovery_errors, *errors],
+        final_completed_keys,
+    )
+    write_jsonl(args.output_dir / "covenants.jsonl", merged_covenants)
+    write_jsonl(args.output_dir / "covenant_evidence.jsonl", merged_evidence)
+    write_jsonl(args.output_dir / "stage3_errors.jsonl", remaining_errors)
+    (args.output_dir / "stage3_results.json").write_text(
+        json.dumps(merged_covenants, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(
-        "Stage 3 -> Stage 5: "
-        f"{coverage['validated_cells']}/{coverage['expected_cells']} validated; "
-        f"{coverage['coverage_gaps']} gaps; "
-        f"{coverage['input_errors']} input errors; "
-        f"ready={coverage['stage5_ready']}; "
-        f"{simplified_count} simplified records written"
+        f"Stage 3 complete: {len(merged_covenants)} covenants; "
+        f"{len(remaining_errors)} review/error records."
     )
 
 
