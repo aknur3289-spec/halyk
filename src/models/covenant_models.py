@@ -10,7 +10,7 @@ import re
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 CalculationKind = Literal[
@@ -80,9 +80,12 @@ class CovenantSpec(BaseModel):
     previous Stage 3 output. New extraction must provide ``calculation_kind``.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     scenario_id: str | None = None
     clause: str
     metric: str
+    category: str | None = None
     calculation_kind: CalculationKind | None = None
     calculator: str | None = None
     operator: Literal["<=", ">=", "<", ">", "=="]

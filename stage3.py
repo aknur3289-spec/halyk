@@ -1,4 +1,4 @@
-"""Stage 3: extract grounded CovenantSpec records from parsed PDFs."""
+"""Stage 3: template-driven, grounded covenant extraction."""
 
 from __future__ import annotations
 
