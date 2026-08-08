@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -62,6 +63,20 @@ class PDFDocumentParser:
         except (OSError, subprocess.CalledProcessError) as exc:
             return "", f"ocr_failed: {exc}"
 
+    @staticmethod
+    def _needs_ocr(text: str, page_number: int) -> bool:
+        """OCR blank or sparse image pages that contain only page furniture."""
+
+        compact = " ".join(text.split())
+        if not compact:
+            return True
+        if re.fullmatch(rf"{re.escape(str(page_number))}", compact):
+            return True
+        # A heading plus a page number is common on image-only audit tables.
+        # OCRing short pages recovers the table while preserving ordinary text
+        # pages and avoids silently treating a sparse page as complete.
+        return len(compact) < 100
+
     def parse_pdf(self, pdf_path: Path) -> dict:
         print(f"Processing: {pdf_path.name}")
         pages = []
@@ -71,15 +86,21 @@ class PDFDocumentParser:
                 text = (page.extract_text() or "").strip()
                 text_source = "pdf_text" if text else "none"
                 ocr_status = None
-                if not text:
+                if self._needs_ocr(text, page.page_number):
                     self.ocr_pages += 1
-                    text, ocr_status = self._ocr_page(pdf_path, page.page_number)
-                    if text:
+                    ocr_text, ocr_status = self._ocr_page(pdf_path, page.page_number)
+                    if ocr_text:
+                        text = ocr_text
                         self.ocr_succeeded += 1
                         text_source = "ocr"
                     else:
-                        self.ocr_unavailable += 1
-                        text_source = "unavailable"
+                        if not text:
+                            self.ocr_unavailable += 1
+                            text_source = "unavailable"
+                        else:
+                            # Keep sparse PDF text when OCR is unavailable;
+                            # the record still shows that OCR was attempted.
+                            text_source = "pdf_text_sparse"
                 pages.append(
                     {
                         "page": page.page_number,
