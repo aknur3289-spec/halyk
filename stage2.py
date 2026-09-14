@@ -131,12 +131,25 @@ def main() -> None:
     documents = json.loads(args.parsed.read_text(encoding="utf-8"))
     ledger = LedgerService(args.ledger)
     ledger.initialize()
+    # Account identifiers are dataset-defined.  The public set uses ACC-*;
+    # private sets may use another authoritative prefix (for example
+    # TELE-4471).  Match only IDs that actually exist in the loaded ledger so
+    # transaction IDs such as TXN-KC-0019 are never mistaken for accounts.
+    known_account_ids = sorted(ledger.account_mapping, key=len, reverse=True)
+    account_pattern = (
+        re.compile(
+            r"(?<![A-Z0-9])(?:" + "|".join(re.escape(account) for account in known_account_ids) + r")(?![A-Z0-9])",
+            re.IGNORECASE,
+        )
+        if known_account_ids
+        else ACCOUNT_RE
+    )
     borrower_map = load_borrower_map(args.borrower_map)
     records = []
     for document in documents:
         try:
             text = document_text(document)
-            accounts = sorted({match.group(0).upper() for match in ACCOUNT_RE.finditer(text)})
+            accounts = sorted({match.group(0).upper() for match in account_pattern.finditer(text)})
             borrower = BORROWER_RE.search(text)
             borrower_name = borrower.group(1).strip() if borrower else None
             account_id = accounts[0] if len(accounts) == 1 else None
