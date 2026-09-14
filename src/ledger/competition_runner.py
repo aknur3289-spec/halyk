@@ -70,6 +70,10 @@ def run_competition_pipeline(config: CompetitionRunConfig) -> CompetitionRunResu
         covenant = _build_covenant(row, scenario_id=scenario_id)
         facts = _build_facts(facts_by_scenario, scenario_id=scenario_id)
         ledger = ledger_service.get_ledger(str(scenario_id))
+        if derivation_context is not None:
+            excluded = set(derivation_context.excluded_transaction_ids.get(str(scenario_id), ()))
+            if excluded and "txn_id" in ledger.columns:
+                ledger = ledger.loc[~ledger["txn_id"].astype(str).str.upper().isin(excluded)].reset_index(drop=True)
         try:
             compiled = compile_ledger_inputs(
                 covenant,
